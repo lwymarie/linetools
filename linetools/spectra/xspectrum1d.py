@@ -801,10 +801,10 @@ class XSpectrum1D(object):
         funit = self.flux.unit
         flux = self.flux.value
 
-        # Deal with nan
-        badf = np.isnan(flux)
+        # Deal with nan and inf
+        badf = np.isnan(flux) | np.isinf(flux)
         if np.sum(badf) > 0:
-            warnings.warn("Ignoring NAN in flux")
+            warnings.warn("Ignoring NAN and inf in flux")
         gdf = ~badf
         flux = flux[gdf]
 
@@ -818,6 +818,7 @@ class XSpectrum1D(object):
         med_dwv = np.median(dwv.value)
 
         wvh = wvh[gdf]
+        dwv_all = dwv
         dwv = dwv[gdf]
 
         # Error
@@ -874,10 +875,11 @@ class XSpectrum1D(object):
             gd = new_var > 0.
             new_sig[gd] = np.sqrt(new_var[gd].value)
             # Deal with bad pixels
-            bad = np.where(var <= 0.)[0]
+#            bad = np.where(var <= 0.)[0]
+            bad = np.where(self.sig.value <= 0.)[0]
             for ibad in bad:
                 bad_new = np.where(np.abs(new_wv-self.wavelength[ibad]) <
-                                   (new_dwv[1:]+dwv[ibad])/2)[0]
+                                   (new_dwv[1:]+dwv_all[ibad])/2)[0]
                 new_sig[bad_new] = 0.
         else:
             new_sig = None
@@ -891,7 +893,8 @@ class XSpectrum1D(object):
 
         newspec = XSpectrum1D.from_tuple((new_wv, new_fx*funit,
                                           new_sig, new_co),
-                                         meta=self.meta.copy(), **kwargs)
+                                         meta=self.meta.copy(),
+                                         masking='none', **kwargs)
         # Return
         return newspec
 
