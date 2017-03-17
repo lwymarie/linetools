@@ -15,7 +15,7 @@ from astropy.io import fits
 #from astropy.nddata import StdDevUncertainty
 from astropy.table import QTable, Column, Table
 
-import linetools.utils as liu
+import linetools.utils as ltu
 
 from .plotting import get_flux_plotrange
 from .utils import meta_to_disk
@@ -32,8 +32,8 @@ class XSpectrum1D(object):
 
     Parameters
     ----------
-    data : `~numpy.ndarray`
-        Structured array containing all of the data
+    data : `~numpy.ma.ndarray`
+        Structured, masked array containing all of the data
         This can be a set of 1D spectra
 
     meta : `dict`-like object, optional
@@ -76,57 +76,10 @@ class XSpectrum1D(object):
         slf = cls.from_tuple((spec1d.dispersion, spec1d.flux))
         return slf
 
+    """ DEPRECATED -- Use spectra.utils.collate
     @classmethod
     def from_list(cls, xspecs, **kwargs):
-        """ Generate a single XSpectrum1D instance containing an array of
-        spectra from a list of individual XSpectrum1D spectra.
-        Each spectrum is padded with extra pixels so that the
-        wavelength ranges of all spectra are covered.
-        Padded pixels are masked.
-
-        Also note that masked pixels in the original data are ignored!
-
-        Uses meta to store headers
-
-        Parameters
-        ----------
-        xspecs : list
-
-        """
-        nspec = len(xspecs)
-        # Find max npix
-        max_npix = 0
-        unit0 = xspecs[0].units
-        for xspec in xspecs:
-            max_npix = max(max_npix, xspec.npix)
-            # Check units
-            for key in unit0.keys():
-                assert unit0[key] == xspec.units[key]
-        # Generate dummy arrays
-        wave = np.zeros([nspec, max_npix], dtype='float64')
-        flux = np.zeros([nspec, max_npix], dtype='float32')
-        if xspec.sig_is_set:
-            sig = np.zeros_like(flux)
-        else:
-            sig = None
-        if xspec.co_is_set:
-            co = np.zeros_like(flux)
-        else:
-            co = None
-        # Fill
-        meta = dict(headers=[])
-        for jj,xspec in enumerate(xspecs):
-            wave[jj,0:xspec.npix] = xspec.wavelength.value
-            flux[jj,0:xspec.npix] = xspec.flux.value
-            if xspec.sig_is_set:
-                sig[jj,0:xspec.npix] = xspec.sig.value
-            if xspec.co_is_set:
-                co[jj,0:xspec.npix] = xspec.co.value
-            # Meta
-            meta['headers'].append(xspec.header)
-        # Finish
-        return cls(wave,flux,sig=sig,co=co, units=unit0, masking='edges',
-                   meta=meta)
+    """
 
     @classmethod
     def from_tuple(cls, ituple, sort=True, **kwargs):
@@ -362,9 +315,12 @@ class XSpectrum1D(object):
         """ Return the flux with units
         """
         #flux =  self.data[self.select]['flux'] * self.units['flux']
-        flux =  self.data['flux'][self.select].compressed() * self.units['flux']
+        flux = self.data['flux'][self.select].compressed() * self.units['flux']
         if self.normed and self.co_is_set:
-            flux /= self.data['co'][self.select].compressed()
+            # Avoid dividing by zero
+            co = self.data['co'][self.select].compressed()
+            gdco = co != 0.
+            flux[gdco] /= co[gdco]
         return flux
 
     @flux.setter
@@ -394,16 +350,32 @@ class XSpectrum1D(object):
         #sig = self.data[self.select]['sig'] * self.units['flux']
         sig = self.data['sig'][self.select].compressed() * self.units['flux']
         if self.normed and self.co_is_set:
-            sig /= self.data['co'][self.select].compressed()
+            # Avoid dividing by zero
+            co = self.data['co'][self.select].compressed()
+            gdco = co != 0.
+            sig[gdco] /= co[gdco]
         return sig
 
     @sig.setter
     def sig(self, value):
-        """ Assumes units are the same as the flux
+        """ Set the error array to a float or same sized array
         """
         gdp = ~self.data['sig'][self.select].mask
         self.data['sig'][self.select][gdp] = value
 
+    @property
+    def ivar(self):
+        """ Return the inverse variance.  Bad pixels have 0 value
+        """
+        if not self.sig_is_set:
+            warnings.warn("This spectrum does not contain an input error array")
+            return np.nan
+        #
+        sig = self.sig
+        ivar = np.zeros_like(sig)
+        gdp = sig > 0.
+        ivar[gdp] = 1. / sig[gdp]**2
+        return ivar
 
     @property
     def co_is_set(self):
@@ -688,9 +660,9 @@ class XSpectrum1D(object):
         # Launch XSpectrum1D??
         if 'xspec' in kwargs:
             import sys
-            from PyQt4 import QtGui
+            from PyQt5.QtWidgets import QApplication
             from linetools.guis.xspecgui import XSpecGui
-            app = QtGui.QApplication(sys.argv)
+            app = QApplication(sys.argv)
             gui = XSpecGui(self)
             gui.show()
             app.exec_()
@@ -772,7 +744,7 @@ class XSpectrum1D(object):
                 plt.show()
 
     #  Rebin
-    def rebin(self, new_wv, do_sig=False, **kwargs):
+    def rebin(self, new_wv, all=False, **kwargs):
         """ Rebin to a new wavelength array
 
         Uses simple linear interpolation.  The default (and only)
@@ -791,112 +763,27 @@ class XSpectrum1D(object):
           Rebin error too (if it exists).
           S/N is only crudely conserved.
           Rejected pixels are propagated.
+        all : bool, optional
+          Rebin all spectra in the XSpectrum1D object?
+          Set masking='none' to have the resultant spectra all be regsitered, but note
+             that there will still be masking
 
         Returns
         -------
         XSpectrum1D of the rebinned spectrum
         """
-        from scipy.interpolate import interp1d
-        # Save flux info to avoid unit issues
-        funit = self.flux.unit
-        flux = self.flux.value
-
-        # Deal with nan and inf
-        badf = np.isnan(flux) | np.isinf(flux)
-        if np.sum(badf) > 0:
-            warnings.warn("Ignoring NAN and inf in flux")
-        gdf = ~badf
-        flux = flux[gdf]
-
-        # Endpoints of original pixels
-        npix = len(self.wavelength)
-        wvh = (self.wavelength + np.roll(self.wavelength, -1)) / 2.
-        wvh[npix - 1] = self.wavelength[npix - 1] + \
-                        (self.wavelength[npix - 1] - self.wavelength[npix - 2]) / 2.
-        dwv = wvh - np.roll(wvh, 1)
-        dwv[0] = 2 * (wvh[0] - self.wavelength[0])
-        med_dwv = np.median(dwv.value)
-
-        wvh = wvh[gdf]
-        dwv_all = dwv
-        dwv = dwv[gdf]
-
-        # Error
-        if do_sig:
-            var = self.sig.value**2
-            var = var[gdf]
+        from .utils import rebin, collate
+        if not all:
+            new_spec = rebin(self, new_wv, **kwargs)
         else:
-            var = np.ones_like(flux)
-
-        # Cumulative Sum
-        cumsum = np.cumsum(flux * dwv)
-        cumvar = np.cumsum(var * dwv)
-
-        # Interpolate (loses the units)
-        fcum = interp1d(wvh, cumsum, fill_value=0., bounds_error=False)
-        fvar = interp1d(wvh, cumvar, fill_value=0., bounds_error=False)
-
-        # Endpoints of new pixels
-        nnew = len(new_wv)
-        nwvh = (new_wv + np.roll(new_wv, -1)) / 2.
-        nwvh[nnew - 1] = new_wv[nnew - 1] + \
-                         (new_wv[nnew - 1] - new_wv[nnew - 2]) / 2.
-        # Pad starting point
-        bwv = np.zeros(nnew + 1) * new_wv.unit
-        bwv[0] = new_wv[0] - (new_wv[1] - new_wv[0]) / 2.
-        bwv[1:] = nwvh
-
-        # Evaluate and put unit back
-        newcum = fcum(bwv) * dwv.unit
-        newvar = fvar(bwv) * dwv.unit
-
-        # Endpoint
-        if (bwv[-1] > wvh[-1]):
-            newcum[-1] = cumsum[-1]
-            newvar[-1] = cumvar[-1]
-
-        # Rebinned flux, var
-        new_fx = (np.roll(newcum, -1) - newcum)[:-1]
-        new_var = (np.roll(newvar, -1) - newvar)[:-1]
-
-        # Normalize (preserve counts and flambda)
-        new_dwv = bwv - np.roll(bwv, 1)
-        #import pdb
-        # pdb.set_trace()
-        new_fx = new_fx / new_dwv[1:]
-        # Preserve S/N (crudely)
-        med_newdwv = np.median(new_dwv.value)
-        new_var = new_var / (med_newdwv/med_dwv) / new_dwv[1:]
-
-        # Return new spectrum
-        if do_sig:
-            # Create new_sig
-            new_sig = np.zeros_like(new_var)
-            gd = new_var > 0.
-            new_sig[gd] = np.sqrt(new_var[gd].value)
-            # Deal with bad pixels
-#            bad = np.where(var <= 0.)[0]
-            bad = np.where(self.sig.value <= 0.)[0]
-            for ibad in bad:
-                bad_new = np.where(np.abs(new_wv-self.wavelength[ibad]) <
-                                   (new_dwv[1:]+dwv_all[ibad])/2)[0]
-                new_sig[bad_new] = 0.
-        else:
-            new_sig = None
-
-        # update continuum
-        if self.co_is_set:
-            x, y = self._get_contpoints()
-            new_co = self._interp_continuum(x, y, new_wv)
-        else:
-            new_co = None
-
-        newspec = XSpectrum1D.from_tuple((new_wv, new_fx*funit,
-                                          new_sig, new_co),
-                                         meta=self.meta.copy(),
-                                         masking='none', **kwargs)
+            spec_list = []
+            for ii in range(self.nspec):
+                self.select = ii
+                spec_list.append(rebin(self, new_wv, **kwargs))
+            # Collate
+            new_spec = collate(spec_list)
         # Return
-        return newspec
+        return new_spec
 
     # Velo array
     def relative_vel(self, wv_obs):
@@ -915,9 +802,8 @@ class XSpectrum1D(object):
         -------
         velo : Quantity array (km/s)
         """
-        if not isinstance(wv_obs, Quantity):
-            raise ValueError('Input wavelength needs to be a Quantity')
-        return ((self.wavelength - wv_obs) * const.c / wv_obs).to('km/s')
+        velo = ltu.rel_vel(self.wavelength, wv_obs)
+        return velo
 
     #  Box car smooth
     def box_smooth(self, nbox, preserve=False, **kwargs):
@@ -956,10 +842,10 @@ class XSpectrum1D(object):
             orig_pix = np.arange(new_npix * nbox)
 
             # Rebin (mean)
-            new_wv = liu.scipy_rebin(self.wavelength[orig_pix], new_npix)
-            new_fx = liu.scipy_rebin(self.flux[orig_pix], new_npix)
+            new_wv = ltu.scipy_rebin(self.wavelength[orig_pix], new_npix)
+            new_fx = ltu.scipy_rebin(self.flux[orig_pix], new_npix)
             if self.sig_is_set:
-                new_sig = liu.scipy_rebin(
+                new_sig = ltu.scipy_rebin(
                     self.sig[orig_pix], new_npix) / np.sqrt(nbox)
             else:
                 new_sig = None
@@ -1047,7 +933,6 @@ class XSpectrum1D(object):
         return XSpectrum1D.from_tuple(
                 (self.wavelength, smoothflux, newsig), meta=self.meta.copy())
 
-
     def stitch(self, idx=None, scale=1.):
         """ Combine two or more spectra within the .data array
         Simple logic is used to order them by wavelength if the
@@ -1082,6 +967,79 @@ class XSpectrum1D(object):
             spec = ltsu.splice_two(spec.copy(), self.copy(select=idx[kk]))
         # Return
         return spec
+
+    def get_local_s2n(self, wv0, npix=50, flux_th=0., debug=False):
+        """It computes the local average signal-to-noise (s2n) over npix pixels around wv0.
+        If `flux_th` is given, pixels with fluxes below spec.flux*flux_th are masked out, and
+        the range is increased until having npix pixels for doing the calculation.
+
+        Parameters
+        ----------
+        wv0 : Quantity
+            Observed wavelength where to perform the calculation.
+        npix : float or int, optional
+            Number of pixels to perform the calculation (forced to be int).
+            The calculation does not take into account those pixel masked when
+            fl_th is given, in which case the range is increased until having at
+            least npix good pixels. Default is 50.
+        flux_th : float or array of same dimension as self.flux, optional
+            Minimum flux threshold for the S/N estimation. In other words,
+            pixels with self.flux < flux_th are masked out. This is useful
+            to exclude strong absorption features that may be present.
+            If flux_th is float then two things can happen:
+                a. If continuum is defined, we mask self.flux < self.co * flux_th
+                b. If continuum is not defined, we approximate the continuum by smoothing
+                   the spectrum convolving it with a Gaussian kernel of FWHM (in pixels) given
+                   by the maximum between 10*npix and 500.
+
+        Returns
+        -------
+        s2n : float
+            Local average signal-to-noise
+        s2n_sig : float
+            Standard deviation of the s2n measurement
+        """
+
+        # Do some checks
+        if (wv0 < self.wvmin) or (wv0 > self.wvmax):
+            raise IOError("`wv0` is outside spectral range.")
+        if not self.sig_is_set:
+            raise ValueError("Spectrum has not defined an error array; cannot compute signal-to-noise.")
+        npix = int(npix)
+
+        # if flux_th is float, then check whether continuum exists
+        # otherwise we estimate it.
+        if isinstance(flux_th, float):
+            if self.co_is_set:
+                flux_limit = self.co * flux_th
+            else:  # here we estimate the continuum by smoothing the original spectrum
+                n_smooth = np.max([10*npix, 500])
+                smooth_spec = self.gauss_smooth(n_smooth)
+                co = smooth_spec.flux
+                flux_limit = co * flux_th
+        # if it is not float, it should be array like self.flux
+        else:
+            flux_limit = flux_th
+            if len(flux_limit) != len(self.npix):
+                raise ValueError('`flux_th` must be either float or array of same shape as self.flux.')
+
+        # find pixel index for wv0
+        ind = np.argmin(np.fabs(wv0 - self.wavelength))
+
+        # define the wavelength window with at least npix pixels
+        cond_gd_flux = (self.flux > flux_limit) & (self.sig > 0.)
+        if np.sum(cond_gd_flux) < npix:
+            raise ValueError("The spectrum does not satisfy the conditions, try different input parameters.")
+        gd_idx = np.where(cond_gd_flux)[0]  # indices of good pixels
+        idx_diff = np.abs(gd_idx - ind)  # their difference w/r to ind
+        # now sort on idx_diff and grab the closest npix indices and use those
+        gd_idx = gd_idx[np.argsort(idx_diff)[:npix]]
+
+        # define the chunk of spectra to look at
+        fl_aux = self.flux[gd_idx]  # note that the gd_idx are not sorted, but this is fine for this calculation
+        er_aux = self.sig[gd_idx]
+        s2n = fl_aux / er_aux
+        return np.mean(s2n.value), np.std(s2n.value)
 
     def write(self, outfil, FITS_TABLE=False, **kwargs):
         """  Wrapper for writing
@@ -1169,14 +1127,7 @@ class XSpectrum1D(object):
         hdu = fits.HDUList([prihdu])
         prihdu.name = 'FLUX'
 
-        # Wavelength
-        if select:
-            wvhdu = fits.ImageHDU(self.data['wave'][self.select].filled(fill_val))
-        else:
-            wvhdu = fits.ImageHDU(self.data['wave'].filled(fill_val))
-        wvhdu.name = 'WAVELENGTH'
-        hdu.append(wvhdu)
-
+        # Error  (packing LowRedux style)
         if self.sig_is_set:
             if select:
                 sighdu = fits.ImageHDU(self.data['sig'][self.select].filled(fill_val))
@@ -1184,6 +1135,14 @@ class XSpectrum1D(object):
                 sighdu = fits.ImageHDU(self.data['sig'].filled(fill_val))
             sighdu.name = 'ERROR'
             hdu.append(sighdu)
+
+        # Wavelength
+        if select:
+            wvhdu = fits.ImageHDU(self.data['wave'][self.select].filled(fill_val))
+        else:
+            wvhdu = fits.ImageHDU(self.data['wave'].filled(fill_val))
+        wvhdu.name = 'WAVELENGTH'
+        hdu.append(wvhdu)
 
         if self.co_is_set:
             if select:
@@ -1225,7 +1184,7 @@ class XSpectrum1D(object):
         prihdu.header['NSPEC'] = self.nspec
         prihdu.header['NPIX'] = self.npix
         units = self.units.copy()
-        d = liu.jsonify(units)
+        d = ltu.jsonify(units)
         # import pdb; pdb.set_trace()
         prihdu.header['UNITS'] = json.dumps(d)
 
@@ -1249,7 +1208,7 @@ class XSpectrum1D(object):
             hdf5[path]['meta'] = meta_to_disk(self.meta)
         # Units
         units = self.units.copy()
-        d = liu.jsonify(units)
+        d = ltu.jsonify(units)
         hdf5[path]['units'] = json.dumps(d)
         # Data with compression
         hdf5.create_dataset(path+'data', data=self.data.filled(fill_val),
@@ -1290,7 +1249,7 @@ class XSpectrum1D(object):
             hdf5['meta'] = meta_to_disk(self.meta)
         # Units
         units = self.units.copy()
-        d = liu.jsonify(units)
+        d = ltu.jsonify(units)
         hdf5['units'] = json.dumps(d)
         # Data with compression
         hdf5.create_dataset('data', data=self.data.filled(fill_val),
@@ -1360,7 +1319,7 @@ class XSpectrum1D(object):
 
         # Units
         units = self.units.copy()
-        d = liu.jsonify(units)
+        d = ltu.jsonify(units)
         prihdu.header['UNITS'] = json.dumps(d)
 
         # Write
@@ -1467,11 +1426,13 @@ class XSpectrum1D(object):
 
         print('Updating continuum.')
         self.co = wrapper.continuum  # this should work with the assignment, even is self.co_is_set is False
-        if 'contpoints' not in self.meta:
-            self.meta['contpoints'] = []
-        self.meta['contpoints'].extend(
-            [tuple(pts) for pts in wrapper.contpoints])
-        self.meta['contpoints'].sort()
+        # Put into meta -- has been causing trouble
+        if False:
+            if 'contpoints' not in self.meta:
+                self.meta['contpoints'] = []
+            self.meta['contpoints'].extend(
+                [tuple(pts) for pts in wrapper.contpoints])
+            self.meta['contpoints'].sort()
 
     def _interp_continuum(self, x, y, wv=None):
         """ Interpolate the continuum from spline knots.
@@ -1581,11 +1542,57 @@ class XSpectrum1D(object):
         """
 
         x, y = self._get_contpoints()
-
-        #update continuum
         co = self._interp_continuum(x, y, self.wavelength.value)
         self.normalize(co=co)
-        #self.co = co
+
+    def add_to_mask(self, add_mask, compressed=False):
+        """ Add to the mask of the selected spectrum
+        Useful for removing bad pixels
+
+        Parameters
+        ----------
+        add_mask : bool ndarray
+        compressed : bool, optional
+          Input mask only relates to previously unmasked pixels
+        """
+        if add_mask.dtype.name != 'bool':
+            raise IOError("Input mask must be bool")
+        if compressed:
+            gdp = np.where(~self.data['wave'][self.select].mask)[0]
+        else:
+            gdp = np.arange(self.totpix)
+        for key in self.data.dtype.names:
+            self.data[key][self.select].mask[gdp] += add_mask
+
+    def unmask(self):
+        """ Set all mask values to False
+         Useful for some applications (e.g. coadding) but dangerous
+        """
+        warnings.warn("Setting entire mask to False. Be careful..")
+        self.data.mask = False
+
+    def __getitem__(self, item):
+        """ Slice the XSpectrum1D object using a set of input indices
+        Repetition is allowed
+        Headers are passed along without slicing
+
+        Parameters
+        ----------
+        item
+
+        Returns
+        -------
+
+        """
+        # Slice internal data
+        if isinstance(item, int):
+            newdata = self.data[np.array([item])]
+        else:
+            newdata = self.data[item]
+        # Create
+        return XSpectrum1D(newdata['wave'], newdata['flux'], newdata['sig'], newdata['co'],
+                           units=self.units, meta=self.meta)
+
 
     def __dir__(self):
         """ Does something more sensible than what Spectrum1D provides
