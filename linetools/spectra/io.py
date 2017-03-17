@@ -3,8 +3,7 @@
 
 from __future__ import print_function, absolute_import, division, unicode_literals
 
-# Python 2 & 3 compatibility
-try:
+try: # Python 2 & 3 compatibility
     basestring
 except NameError:
     basestring = str
@@ -15,6 +14,8 @@ import numpy as np
 import warnings
 import os, pdb
 import json
+
+from six import itervalues
 
 from astropy.io import fits
 from astropy import units as u
@@ -52,6 +53,8 @@ def readspec(specfil, inflg=None, efil=None, verbose=False, multi_ivar=False,
       Selected spectrum (for sets of 1D spectra, e.g. DESI brick)
     head_exten : int, optional
       Extension for header to ingest
+    **kwargs : optional
+      Passed to XSpectrum1D object
 
     Returns
     -------
@@ -124,7 +127,7 @@ def readspec(specfil, inflg=None, efil=None, verbose=False, multi_ivar=False,
             if debug:
                 print(
   'linetools.spectra.io.readspec(): Assuming separate flux and err files.')
-            xspec1d = parse_linetools_spectrum_format(hdulist)
+            xspec1d = parse_linetools_spectrum_format(hdulist, **kwargs)
 
         else:  # ASSUMING MULTI-EXTENSION
             co=None
@@ -155,7 +158,9 @@ def readspec(specfil, inflg=None, efil=None, verbose=False, multi_ivar=False,
 
             # Look for co
             if len(hdulist) == 4:
-                co = hdulist[3].data.flatten()
+                data = hdulist[3].data
+                if 'float' in data.dtype.name:  # This can be an int mask (e.g. BOSS)
+                    co = data
 
             wave = give_wv_units(wave)
             xspec1d = XSpectrum1D.from_tuple((wave, fx, sig, co), **kwargs)
@@ -178,20 +183,7 @@ def readspec(specfil, inflg=None, efil=None, verbose=False, multi_ivar=False,
         print('Not sure what has been input.  Send to JXP.')
         return
 
-
-    # Generate, as needed
-    """
-    if 'xspec1d' not in locals():
-        # Give Ang as default
-        if not hasattr(wave, 'unit'):
-            uwave = u.Quantity(wave, unit=u.AA)
-        elif wave.unit is None:
-            uwave = u.Quantity(wave, unit=u.AA)
-        else:
-            uwave = u.Quantity(wave)
-        xspec1d = XSpectrum1D.from_tuple((wave, fx, sig, None))
-    """
-
+    # Check for bad wavelengths
     if np.any(np.isnan(xspec1d.wavelength)):
         warnings.warn('WARNING: Some wavelengths are NaN')
 
@@ -298,8 +290,8 @@ def get_wave_unit(tag, hdulist, idx=None):
         # NEED HEADER INFO
         return None
     # Try table header (following VLT/X-Shooter here)
-    keys = header.keys()
-    values = header.values()
+    keys = list(header)  # Python 3
+    values = list(itervalues(header)) # Python 3
     hidx = values.index(tag)
     if keys[hidx][0:5] == 'TTYPE':
         try:
@@ -307,7 +299,7 @@ def get_wave_unit(tag, hdulist, idx=None):
         except KeyError:
            return None
         else:
-            if tunit == 'Angstroem':
+            if tunit in ['Angstroem', 'Angstroms']:
                 tunit = 'Angstrom'
             unit = Unit(tunit)
             return unit
@@ -577,7 +569,7 @@ def parse_FITS_binary_table(hdulist, exten=None, wave_tag=None, flux_tag=None,
         xspec1d.meta.update(json.loads(hdulist[0].header['METADATA']))
     return xspec1d
 
-def parse_linetools_spectrum_format(hdulist):
+def parse_linetools_spectrum_format(hdulist, **kwargs):
     """ Parse an old linetools-format spectrum from an hdulist
 
     Parameters
@@ -592,8 +584,6 @@ def parse_linetools_spectrum_format(hdulist):
     """
     if 'WAVELENGTH' not in hdulist:
         pdb.set_trace()
-        #spec1d = spec_read_fits.read_fits_spectrum1d(
-        #    os.path.expanduser(datfil), dispersion_unit='AA')
         xspec1d = XSpectrum1D.from_spec1d(spec1d)
     else:
         wave = hdulist['WAVELENGTH'].data * u.AA
@@ -610,15 +600,18 @@ def parse_linetools_spectrum_format(hdulist):
     else:
         co = None
 
-    xspec1d = XSpectrum1D.from_tuple((wave, fx, sig, co))
+    xspec1d = XSpectrum1D.from_tuple((wave, fx, sig, co), **kwargs)
 
     if 'METADATA' in hdulist[0].header:
-        xspec1d.meta.update(json.loads(hdulist[0].header['METADATA']))
+        # Prepare for JSON (bug fix of sorts)
+        metas = hdulist[0].header['METADATA']
+        ipos = metas.rfind('}')
+        xspec1d.meta.update(json.loads(metas[:ipos+1]))
 
     return xspec1d
 
 
-def parse_hdf5(inp, **kwargs):
+def parse_hdf5(inp, close=True, **kwargs):
     """ Read a spectrum from HDF5 written in XSpectrum1D format
     Expects:  meta, data, units
 
@@ -646,7 +639,11 @@ def parse_hdf5(inp, **kwargs):
         meta = json.loads(hdf5[path+'meta'].value)
         # Headers
         for jj,heads in enumerate(meta['headers']):
-            meta['headers'][jj] = fits.Header.fromstring(meta['headers'][jj])
+            try:
+                meta['headers'][jj] = fits.Header.fromstring(meta['headers'][jj])
+            except TypeError:  # dict
+                if not isinstance(meta['headers'][jj], dict):
+                    raise IOError("Bad meta type")
     else:
         meta = None
     # Units
@@ -666,7 +663,8 @@ def parse_hdf5(inp, **kwargs):
     except (NameError, IndexError):
         co = None
     # Finish
-    hdf5.close()
+    if close:
+        hdf5.close()
     return XSpectrum1D(data['wave'], data['flux'], sig=sig, co=co,
                           meta=meta, units=units, **kwargs)
 
@@ -687,15 +685,18 @@ def parse_DESI_brick(hdulist, select=0):
     """
     fx = hdulist[0].data
     # Sig
-    ivar = hdulist[1].data
-    sig = np.zeros_like(ivar)
-    gdi = ivar > 0.
-    sig[gdi] = np.sqrt(1./ivar[gdi])
+    if hdulist[1].name in ['ERROR', 'SIG']:
+        sig = hdulist[1].data
+    else:
+        ivar = hdulist[1].data
+        sig = np.zeros_like(ivar)
+        gdi = ivar > 0.
+        sig[gdi] = np.sqrt(1./ivar[gdi])
     # Wave
     wave = hdulist[2].data
     wave = give_wv_units(wave)
-    #wave = np.outer(np.ones(fx.shape[0]), wave)
-    wave = np.tile(wave, (fx.shape[0],1))
+    if wave.shape != fx.shape:
+        wave = np.tile(wave, (fx.shape[0],1))
     # Finish
     xspec1d = XSpectrum1D(wave, fx, sig, select=select)
     return xspec1d

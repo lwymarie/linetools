@@ -20,7 +20,6 @@ lt_path = imp.find_module('linetools')[1]
 
 
 # TODO
-# Ingest Galaxy lines
 # Ingest AGN lines
 # Add Ej, Ek, Ex for emission lines (specially Balmer, Paschen and Brackett)
 
@@ -153,6 +152,7 @@ def read_H2():
 
     # Units
     data['wrest'].unit = u.AA
+    data['gamma'].unit = 1./u.s
 
     # Rename some columns
     data.rename_column('Jp', 'Jj')
@@ -222,8 +222,11 @@ def read_verner94():
     print(
         'linetools.lists.parse: Reading linelist --- \n   {:s}'.format(
             verner94))
-    tbl_6 = QTable.read(verner94)
+    tbl_6 = Table.read(verner94)
 
+    # Deal with bad unit
+    tbl_6['lambda'].unit = u.AA
+    tbl_6 = QTable(tbl_6)
 
     # My table
     ldict, data = line_data(nrows=len(tbl_6))
@@ -239,8 +242,7 @@ def read_verner94():
         data[ii]['name'] = (
             row['Species'][0:2].strip() + row['Species'][2:].strip() + 
             ' {:d}'.format(int(row['lambda'].value)))
-        #xdb.set_trace()
-        # name
+    # name
     names = []
     for row in data:
         ionnm = ions.ion_name((row['Z'], row['ion']))
@@ -273,6 +275,7 @@ def read_forbidden():
 
     # load values using convention names
     data['wrest'] = aux['wave']
+    data['wrest'].unit = u.AA
     data['Z'] = aux['Z']
     data['ion'] = aux['ion']
     for ii, row in enumerate(data):
@@ -302,6 +305,7 @@ def read_recomb():
 
     # load values using convention names
     data['wrest'] = aux['wave']
+    data['wrest'].unit = u.AA
     data['Z'] = aux['Z']
     data['ion'] = aux['ion']
     for ii, row in enumerate(data):
@@ -330,6 +334,7 @@ def read_galabs():
 
     # load values using convention names
     data['wrest'] = aux['wave']
+    data['wrest'].unit = u.AA
     data['Z'] = aux['Z']
     data['ion'] = aux['ion']
     for ii, row in enumerate(data):

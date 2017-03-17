@@ -6,21 +6,25 @@ from __future__ import print_function, absolute_import, division, unicode_litera
 import numpy as np
 import pdb
 
-from PyQt4 import QtGui
-from PyQt4 import QtCore
+from PyQt5 import QtGui
+from PyQt5 import QtCore
+from PyQt5.QtWidgets import QWidget, QDialog, QPushButton, QLabel
+from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QListWidget
 
 from astropy.units import Quantity
 from astropy import constants as const
 from astropy import units as u
+
 u.def_unit(['mAA', 'milliAngstrom'], 0.001 * u.AA, namespace=globals()) # mA
 
-from matplotlib.backends.backend_qt4agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from astropy.modeling import models, fitting
 
 from linetools.isgm.abssystem import GenericAbsSystem
 from linetools import utils as ltu
+from linetools.lists.linelist import LineList
 from linetools.guis import utils as ltgu
 from linetools.guis import simple_widgets
 from linetools.guis import line_widgets as ltgl
@@ -29,8 +33,78 @@ from ..spectralline import AbsLine
 from ..analysis import voigt as ltv
 from .xabssysgui import XAbsSysGui
 
+try:
+    basestring
+except NameError:  # For Python 3
+    basestring = str
 
-class ExamineSpecWidget(QtGui.QWidget):
+class ExSpecDialog(QDialog):
+    """
+    """
+    def __init__(self, ispec, parent=None, **kwargs):
+        """
+        Parameters
+        ----------
+        lbl : str
+        format : str
+          Format for value
+        """
+        super(ExSpecDialog, self).__init__(parent)
+
+        # Grab the pieces and tie together
+        self.pltline_widg = ltgl.PlotLinesWidget(status=None, init_z=0.)
+        self.pltline_widg.setMaximumWidth(300)
+        # Grab the Widget
+        #QtCore.pyqtRemoveInputHook()
+        #pdb.set_trace()
+        #QtCore.pyqtRestoreInputHook()
+        self.spec_widg = ExamineSpecWidget(ispec, llist=self.pltline_widg.llist, zsys=0., **kwargs)
+        self.spec_widg.canvas.mpl_connect('button_press_event', self.on_click)
+        # Layout
+        rside = QWidget()
+        rside.setMaximumWidth(300)
+        vbox = QVBoxLayout()
+        qbtn = QPushButton(self)
+        qbtn.setText('Quit')
+        qbtn.clicked.connect(self.quit)
+        vbox.addWidget(self.pltline_widg)
+        vbox.addWidget(qbtn)
+        rside.setLayout(vbox)
+
+        hbox = QHBoxLayout()
+        hbox.addWidget(self.spec_widg)
+        hbox.addWidget(rside)
+        self.setLayout(hbox)
+
+    def on_click(self, event):
+        """ Over-loads click events
+        """
+        if event.button == 3: # Set redshift
+            if self.pltline_widg.llist['List'] is None:
+                return
+            self.select_line_widg = ltgl.SelectLineWidget(
+                    self.pltline_widg.llist[self.pltline_widg.llist['List']]._data)
+            self.select_line_widg.exec_()
+            line = self.select_line_widg.line
+            if line.strip() == 'None':
+                return
+            #
+            quant = line.split('::')[1].lstrip()
+            spltw = quant.split(' ')
+            wrest = Quantity(float(spltw[0]), unit=spltw[1])
+            z = event.xdata/wrest.value - 1.
+            self.pltline_widg.llist['z'] = z
+
+            self.pltline_widg.zbox.setText('{:.5f}'.format(self.pltline_widg.llist['z']))
+
+            # Draw
+            self.spec_widg.on_draw()
+
+    def quit(self):
+        self.close()
+
+
+class ExamineSpecWidget(QWidget):
     """ Widget to plot a spectrum and interactively
         fiddle about.  Akin to XIDL/x_specplot.pro
 
@@ -139,7 +213,7 @@ class ExamineSpecWidget(QtGui.QWidget):
         if filename is not None:
             self.fig.suptitle(filename)
 
-        vbox = QtGui.QVBoxLayout()
+        vbox = QVBoxLayout()
         vbox.addWidget(self.canvas)
 
         self.setLayout(vbox)
@@ -224,8 +298,7 @@ class ExamineSpecWidget(QtGui.QWidget):
             zlya = event.xdata/1215.6701 - 1.
             self.llist['z'] = zlya
             # Generate Lya profile
-            lya_line = AbsLine(1215.6701*u.AA)
-            lya_line.attrib['z'] = zlya
+            lya_line = AbsLine(1215.6701*u.AA, z=zlya)
             lya_line.attrib['N'] = NHI
             lya_line.attrib['b'] = 30. * u.km/u.s
             lya_spec = ltv.voigt_from_abslines(self.spec.wavelength, lya_line, fwhm=3.)
@@ -244,7 +317,7 @@ class ExamineSpecWidget(QtGui.QWidget):
             #QtCore.pyqtRemoveInputHook()
             #xdb.set_trace()
             #QtCore.pyqtRestoreInputHook()
-            if (event.key in ['N', 'E']) & (self.llist['List'] == 'None'):
+            if (event.key in ['N']) & (self.llist['List'] == 'None'):
                 print('xspec: Choose a Line list first!')
                 try:
                     self.statusBar().showMessage('Choose a Line list first!')
@@ -321,6 +394,9 @@ class ExamineSpecWidget(QtGui.QWidget):
                         sig_flux2 = np.sqrt(np.sum(self.spec.sig[pix].value**2))
                     else:
                         sig_flux2 = 9e9
+                    # EW
+                    dwv = self.spec.wavelength - np.roll(self.spec.wavelength,1)
+                    EW = np.sum((-1*model_Gauss[pix]/lconti[pix]) * np.abs(dwv[pix]))  # Model Gauss is above/below continuum
                     #QtCore.pyqtRemoveInputHook()
                     #pdb.set_trace()
                     #QtCore.pyqtRestoreInputHook()
@@ -330,38 +406,41 @@ class ExamineSpecWidget(QtGui.QWidget):
                             parm.mean.value, parm.amplitude.value, parm.stddev.value, flux)
                     mssg = mssg+' ::  sig(Mean)={:g}, sig(Amplitude)={:g}, sig(sigma)={:g}, sig(flux)={:g}'.format(
                             sig_dict['mean'], sig_dict['amplitude'], sig_dict['stddev'], min(sig_flux1,sig_flux2))
+                    mssg = mssg+' :: EW ={:g}'.format(EW)
                 else:
-                    # Find the spectral line (or request it!)
-                    rng_wrest = iwv / (self.llist['z']+1)
-                    gdl = np.where( (self.llist[self.llist['List']].wrest-rng_wrest[0]) *
-                                    (self.llist[self.llist['List']].wrest-rng_wrest[1]) < 0.)[0]
-                    if len(gdl) == 1:
-                        wrest = self.llist[self.llist['List']].wrest[gdl[0]]
-                        closest = False
-                    else:
-                        if len(gdl) == 0: # Search through them all
-                            gdl = np.arange(len(self.llist[self.llist['List']]))
-                        sel_widg = ltgl.SelectLineWidget(self.llist[self.llist['List']]._data[gdl])
-                        sel_widg.exec_()
-                        line = sel_widg.line
-                        #wrest = float(line.split('::')[1].lstrip())
-                        quant = line.split('::')[1].lstrip()
-                        spltw = quant.split(' ')
-                        wrest = Quantity(float(spltw[0]), unit=spltw[1])
-                        closest = True
-                    # Units
-                    if not hasattr(wrest,'unit'):
-                        # Assume Ang
-                        wrest = wrest * u.AA
+                    aline = None
+                    if self.llist['List'] != 'None':
+                        # Find the spectral line (or request it!)
+                        rng_wrest = iwv / (self.llist['z']+1)
+                        gdl = np.where( (self.llist[self.llist['List']].wrest-rng_wrest[0]) *
+                                        (self.llist[self.llist['List']].wrest-rng_wrest[1]) < 0.)[0]
+                        if len(gdl) == 1:
+                            wrest = self.llist[self.llist['List']].wrest[gdl[0]]
+                            closest = False
+                        else:
+                            if len(gdl) == 0: # Search through them all
+                                gdl = np.arange(len(self.llist[self.llist['List']]))
+                            sel_widg = ltgl.SelectLineWidget(self.llist[self.llist['List']]._data[gdl])
+                            sel_widg.exec_()
+                            line = sel_widg.line
+                            #wrest = float(line.split('::')[1].lstrip())
+                            quant = line.split('::')[1].lstrip()
+                            spltw = quant.split(' ')
+                            wrest = Quantity(float(spltw[0]), unit=spltw[1])
+                            closest = True
+                        # Units
+                        if not hasattr(wrest,'unit'):
+                            # Assume Ang
+                            wrest = wrest * u.AA
 
-                    # Generate the Spectral Line
-                    aline = AbsLine(wrest,linelist=self.llist[self.llist['List']],
-                                    z=self.llist['z'], closest=closest)
-                    # Generate a temporary spectrum for analysis and apply the local continuum
-                    tspec = XSpectrum1D.from_tuple((self.spec.wavelength,
-                                                    self.spec.flux, self.spec.sig))
-                    tspec.normalize(lconti)
-                    aline.analy['spec'] = tspec
+                        # Generate the Spectral Line
+                        aline = AbsLine(wrest,linelist=self.llist[self.llist['List']],
+                                        z=self.llist['z'], closest=closest)
+                        # Generate a temporary spectrum for analysis and apply the local continuum
+                        tspec = XSpectrum1D.from_tuple((self.spec.wavelength,
+                                                        self.spec.flux, self.spec.sig))
+                        tspec.normalize(lconti)
+                        aline.analy['spec'] = tspec
 
                     # AODM
                     if event.key == 'N':
@@ -378,11 +457,12 @@ class ExamineSpecWidget(QtGui.QWidget):
                         mssg = mssg + ' ::  logN = {:g} +/- {:g}'.format(
                             aline.attrib['logN'], aline.attrib['sig_logN'])
                     elif event.key == 'E':  #EW
-                        aline.limits.set(iwv)
-                        aline.measure_restew()
-                        mssg = 'Using '+ aline.__repr__()
-                        mssg = mssg + ' ::  Rest EW = {:g} +/- {:g}'.format(
-                            aline.attrib['EW'].to(mAA), aline.attrib['sig_EW'].to(mAA))
+                        if aline is not None:
+                            aline.limits.set(iwv)
+                            aline.measure_restew()
+                            mssg = 'Using '+ aline.__repr__()
+                            mssg = mssg + ' ::  Rest EW = {:g} +/- {:g}'.format(
+                                aline.attrib['EW'].to(mAA), aline.attrib['sig_EW'].to(mAA))
                 # Display values
                 try:
                     self.statusBar().showMessage(mssg)
@@ -582,7 +662,7 @@ class ExamineSpecWidget(QtGui.QWidget):
                      ]
 
 # ######################
-class VelPlotWidget(QtGui.QWidget):
+class VelPlotWidget(QWidget):
     """ Widget for a velocity plot with interaction.
     Akin to XIDL/x_velplot
 
@@ -680,7 +760,7 @@ U         : Indicate as a upper limit
         self.fig.subplots_adjust(hspace=0.0, wspace=0.1)
 
         # Layout
-        vbox = QtGui.QVBoxLayout()
+        vbox = QVBoxLayout()
         vbox.addWidget(self.canvas)
         self.setLayout(vbox)
 
@@ -979,7 +1059,8 @@ U         : Indicate as a upper limit
                 if (((jj+1) % self.sub_xy[0]) == 0) or ((jj+1) == len(all_idx)):
                     self.ax.set_xlabel('Relative Velocity (km/s)')
                 else:
-                    self.ax.get_xaxis().set_ticks([])
+                    #self.ax.get_xaxis().set_ticks([])
+                    self.ax.tick_params(labelbottom='off')
                 lbl = self.llist[self.llist['List']].name[idx]
                 # Kinematics
                 kinl = ''
@@ -997,7 +1078,7 @@ U         : Indicate as a upper limit
 
                 # Reset window limits
                 #QtCore.pyqtRemoveInputHook()
-                #xdb.set_trace()
+                #pdb.set_trace()
                 #QtCore.pyqtRestoreInputHook()
                 self.ax.set_xlim(self.psdict['x_minmax'])
 
@@ -1074,3 +1155,135 @@ U         : Indicate as a upper limit
                                  drawstyle='steps-mid', color=clr)
         # Draw
         self.canvas.draw()
+
+
+class AbsSysWidget(QWidget):
+    """ Widget to organize AbsSys along a given sightline
+
+    Parameters:
+    -----------
+    abssys_list: List
+      String list of abssys files
+
+    16-Dec-2014 by JXP
+    """
+    def __init__(self, abssys_list, parent=None,
+        only_one=False, linelist=None, no_buttons=False):
+        """
+        only_one: bool, optional
+          Restrict to one selection at a time? [False]
+        no_buttons: bool, optional
+          Eliminate Refine/Reload buttons?
+        """
+        super(AbsSysWidget, self).__init__(parent)
+
+        #if not status is None:
+        #    self.statusBar = status
+        self.abssys_list = abssys_list
+
+        # Speeds things up
+        if linelist is None:
+            self.linelist = LineList('ISM')
+        else:
+            self.linelist = linelist
+
+        # Create the line list
+        list_label = QLabel('Abs Systems:')
+        self.abslist_widget = QListWidget(self)
+        if not only_one:
+            self.abslist_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.abslist_widget.addItem('None')
+        #self.abslist_widget.addItem('Test')
+
+        # Lists
+        self.abs_sys = []
+        self.items = []
+        self.all_items = []
+        self.all_abssys = []
+        for abssys_fil in self.abssys_list:
+            self.all_abssys.append(GenericAbsSystem.from_json(abssys_fil,
+                linelist=self.linelist))
+            self.add_item(abssys_fil)
+
+        self.abslist_widget.setCurrentRow(0)
+        self.abslist_widget.itemSelectionChanged.connect(self.on_list_change)
+
+        # Layout
+        vbox = QVBoxLayout()
+        vbox.addWidget(list_label)
+
+        # Buttons
+        if not no_buttons:
+            buttons = QWidget()
+            self.refine_button = QPushButton(self)
+            self.refine_button.setText('Refine')
+            #self.refine_button.clicked.connect(self.refine) # CONNECTS TO A PARENT
+            reload_btn = QPushButton(self)
+            reload_btn.setText('Reload')
+            reload_btn.clicked.connect(self.reload)
+            hbox1 = QHBoxLayout()
+            hbox1.addWidget(self.refine_button)
+            hbox1.addWidget(reload_btn)
+            buttons.setLayout(hbox1)
+            vbox.addWidget(buttons)
+
+        vbox.addWidget(self.abslist_widget)
+        self.setLayout(vbox)
+
+    # ##
+    def on_list_change(self):
+
+        items = self.abslist_widget.selectedItems()
+        # Empty the list
+        #self.abs_sys = []
+        if len(self.abs_sys) > 0:
+            for ii in range(len(self.abs_sys)-1,-1,-1):
+                self.abs_sys.pop(ii)
+        # Load up abs_sys (as need be)
+        new_items = []
+        for item in items:
+            txt = item.text()
+            # Dummy
+            if txt == 'None':
+                continue
+            print('Including {:s} in the list'.format(txt))
+            # Using LLS for now.  Might change to generic
+            new_items.append(txt)
+            ii = self.all_items.index(txt)
+            self.abs_sys.append(self.all_abssys[ii])
+
+        # Pass back
+        self.items = new_items
+        #QtCore.pyqtRemoveInputHook()
+        #xdb.set_trace()
+        #QtCore.pyqtRestoreInputHook()
+
+    def add_fil(self,abssys_fil):
+        self.abssys_list.append( abssys_fil )
+        self.add_item(abssys_fil)
+
+    def add_item(self,abssys_fil):
+        ipos0 = abssys_fil.rfind('/') + 1
+        ipos1 = abssys_fil.rfind('.fits')
+        if ipos1 == -1:
+            ipos1 = len(abssys_fil)
+        #
+        self.all_items.append( abssys_fil[ipos0:ipos1] )
+        self.abslist_widget.addItem(abssys_fil[ipos0:ipos1] )
+
+    def remove_item(self,idx):
+        # Delete
+        del self.all_items[idx]
+        del self.all_abssys[idx]
+        tmp = self.abslist_widget.takeItem(idx+1) # 1 for None
+        self.on_list_change()
+
+    def reload(self):
+        print('AbsSysWidget: Reloading systems..')
+        self.all_abssys = []
+        for abssys_fil in self.abssys_list:
+            self.all_abssys.append(GenericAbsSystem.from_json(abssys_fil,
+                linelist=self.linelist))
+            #self.add_item(abssys_fil)
+        self.on_list_change()
+

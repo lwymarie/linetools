@@ -14,18 +14,37 @@ from linetools.spectra import utils as ltsu
 def spec():
     return io.readspec(data_path('UM184_nF.fits'))
 
+
 @pytest.fixture
 def spec2():
     return io.readspec(data_path('PH957_f.fits'))
 
+
 @pytest.fixture
 def specm(spec,spec2):
-    return XSpectrum1D.from_list([spec,spec2])
+    specm = ltsu.collate([spec,spec2])
+    return specm
+
 
 def data_path(filename):
     data_dir = os.path.join(os.path.dirname(__file__), 'files')
     return os.path.join(data_dir, filename)
 
+def test_readwrite_meta_as_dicts(spec):
+    sp = XSpectrum1D.from_tuple((np.array([5,6,7]), np.ones(3), np.ones(3)*0.1))
+    sp.meta['headers'][0] = dict(a=1, b='abc')
+    sp2 = XSpectrum1D.from_tuple((np.array([8,9,10]), np.ones(3), np.ones(3)*0.1))
+    sp2.meta['headers'][0] = dict(c=2, d='efg')
+    spec = ltsu.collate([sp,sp2])
+    # Write
+    spec.write_to_fits(data_path('tmp.fits'))
+    spec.write_to_hdf5(data_path('tmp.hdf5'))
+    # Read and test
+    newspec = io.readspec(data_path('tmp.hdf5'))
+    assert newspec.meta['headers'][0]['a'] == 1
+    assert newspec.meta['headers'][0]['b'] == 'abc'
+    newspec2 = io.readspec(data_path('tmp.fits'))
+    assert 'METADATA' in newspec2.meta['headers'][0].keys()
 
 def test_write(spec,specm):
     # FITS

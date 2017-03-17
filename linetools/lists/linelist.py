@@ -49,7 +49,7 @@ class LineList(object):
         * 'HI'      :: HI Lyman series
         * 'H2'      :: H2 (Lyman-Werner)
         * 'CO'      :: CO UV band-heads
-        * 'EUV'     :: EUV lines (for CASBAH project)
+        * 'EUV'     :: EUV lines (for CASBAH project);  Limited X-ray lines too
         * 'Galaxy'  :: Lines typically identified in galaxy spectra
         * 'AGN'     :: Key AGN lines (to be implemented)
 
@@ -174,7 +174,7 @@ class LineList(object):
             # import pdb
             # pdb.set_trace()
             raise ValueError(
-                'load_data: Not ready for this: {:s}'.format(self.list))
+                'LineList: load_data: Not ready for this LineList name: {:s}'.format(self.list))
 
         full_table = None
         all_func = []
@@ -196,15 +196,12 @@ class LineList(object):
                         wrest = full_table['wrest']
                         newi = []
                         for jj, row in enumerate(table):
-                            try:
-                                mt = np.abs(row['wrest'] - wrest) < tol
-                            except:
-                                import pdb
-                                pdb.set_trace()
+                            mt = np.abs(row['wrest'] - wrest) < tol
                             if mt.sum() == 0:
                                 newi.append(jj)
                         # Append new ones as Tables (can't stack QTables yet)
                         full_table = vstack([Table(full_table), Table(table[newi])])
+                        full_table = QTable(full_table)
                     # Save to avoid repeating
                     all_func.append(func)
 
@@ -329,13 +326,21 @@ class LineList(object):
                                        redo=False):
         """Sets new convenient columns to the self._data QTable. These will be useful
         for sorting the underlying data table in convenient ways, e.g. by expected
-        relative strength.
-        These new column include:
+        relative strength, abundance, etc.
+
+        * For atomic transitions these new columns include:
             - `ion_name` : HI, CIII, CIV, etc
             - `log(w*f)` : np.log10(wrest * fosc)  # in np.log10(AA)
             - `abundance` : either [`none`, `solar`]
             - `ion_correction` : [`none`]
             - `rel_strength` : log(w*f) + abundance + ion_correction
+
+        * For molecules a different approach is used:
+            - `ion_name` : B0-0P, C6-0, etc.
+            - `rel_strength`: We have only three arbitrary levels: [1, 50, 100]
+                    100 is for Jk={0,1}
+                    50 is for Jk={2,3}
+                    1 otherwise
 
         Parameters
         ----------
@@ -349,24 +354,39 @@ class LineList(object):
             Ionization correction. Options are:
                 'none' : No correction applied, so this column will
                          be filled with zeros. (Default)
-         redo : bool, optional
+        redo : bool, optional
             Remake the extra columns
 
-        Note: This function is only implemented for the following
-        lists: HI, ISM, EUV, Strong.
+        Note
+        ----
+        This method is only implemented for the following lists: HI, ISM, EUV, Strong.
+        Partially implemented for: H2.
 
         """
         # Avoid redo (especially for caching)
         if ('ion_name' in self._data.keys()) and (not redo):
             return
 
-        if self.list not in ['HI', 'ISM', 'EUV', 'Strong']:
+        if self.list not in ['HI', 'ISM', 'EUV', 'Strong', 'H2']:
             warnings.warn('Not implemented: will not set relative strength for LineList: {}.'.format(self.list))
             return
 
         # Set ion_name column
-        ion_name = [name.split(' ')[0] for name in self.name]
+        if self.list in ['HI', 'ISM', 'EUV', 'Strong']:
+            ion_name = [name.split(' ')[0] for name in self.name]  # valid for atomic transitions
+        elif self.list in ['H2']:
+            ion_name = [name.split('(')[0] for name in self.name]  # valid for H2
         self._data['ion_name'] = ion_name
+
+        if self.list in ['H2']:
+            # we want Jk to be 1 or 0 first
+            cond = (self._data['Jk'] <= 1)
+            rel_strength = np.where(cond, 100, 1)
+            # second level: Jk = {2,3}
+            cond = (self._data['Jk'] > 1) & (self._data['Jk'] <= 3)
+            rel_strength = np.where(cond, 50, rel_strength)
+            self._data['rel_strength'] = rel_strength
+            return
 
         # Set QM strength as MaskedColumn (self._data['f'] is MaskedColumn)
         qm_strength = self._data['f'] * (self._data['wrest'].to('AA').value)
@@ -552,7 +572,7 @@ class LineList(object):
 
         """
 
-        if self.list not in ['HI', 'ISM', 'EUV', 'Strong']:
+        if self.list not in ['HI', 'ISM', 'EUV', 'Strong', 'H2']:
             warnings.warn('Not implemented for LineList: {}.'.format(self.list))
             return
 
@@ -566,6 +586,15 @@ class LineList(object):
 
         if line == 'unknown':
             return self.unknown_line()
+        if self.list in ['H2']:
+
+            cond = self._data['ion_name'] == line.split('(')[0]
+            tbl = self._data[cond]  # cond is a masked boolean array
+            if len(tbl) > 1:
+                return tbl
+            else:  # this should be always len(tbl)==1 because line was found
+                return self.from_qtable_to_dict(tbl)
+
         else:
             Z = None
             for row in self._data:  # is this loop avoidable?
@@ -580,14 +609,16 @@ class LineList(object):
             if Z is not None:
                 tbl = self.__getitem__((Z, ie))
                 # Make sure the lower energy level is the same too
-                cond = tbl['Ej'] == Ej
+                #cond = tbl['Ej'] == Ej
+                cond = np.array([name1.split(' ')[0] == line for name1 in tbl['name']])
                 tbl = tbl[cond]
+                tbl.sort(['Ej','wrest'])
                 # For hydrogen/deuterium this contains deuterium/hydrogen;
                 # so let's get rid of them
-                if (line == 'HI') or (line == 'DI'):
-                    names = np.array(tbl['name'])
-                    cond = np.array([l.startswith(line) for l in names])
-                    tbl = tbl[cond]
+                #if (line == 'HI') or (line == 'DI'):
+                #    names = np.array(tbl['name'])
+                #    cond = np.array([l.startswith(line) for l in names])
+                #    tbl = tbl[cond]
                 if len(tbl) > 1:
                     return tbl
                 else:  # this should be always len(tbl)==1 because Z is not None

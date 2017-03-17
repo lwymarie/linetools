@@ -1,4 +1,4 @@
-""" Classes for absorption line component
+""" Class for absorption line component
 """
 from __future__ import print_function, absolute_import, division, unicode_literals
 
@@ -24,10 +24,7 @@ from linetools.analysis import plots as ltap
 from linetools.spectralline import AbsLine, SpectralLine
 from linetools.abund import ions
 from linetools import utils as ltu
-
-#import xastropy.atomic as xatom
-#from xastropy.stats import basic as xsb
-#from xastropy.xutils import xdebug as xdb
+from linetools.lists.linelist import LineList
 
 # Global import for speed
 c_kms = const.c.to('km/s').value
@@ -46,6 +43,8 @@ class AbsComponent(object):
     Zion : tuple 
         Atomic number, ion -- (int,int)
         e.g. (8,1) for OI
+        Note: (-1, -1) is special and is meant for molecules (e.g. H2)
+              This notation will most likely be changed in the future.
     zcomp : float
         Component redshift
     vlim : Quantity array
@@ -77,9 +76,8 @@ class AbsComponent(object):
 
         # Instantiate with the first line
         init_line = abslines[0]
-        #init_line.attrib['z'], init_line.analy['vlim'],
         slf = cls( init_line.attrib['coord'], (init_line.data['Z'],init_line.data['ion']),
-                   init_line.attrib['z'], init_line.limits.vlim,
+                   init_line.z, init_line.limits.vlim,
                    Ej=init_line.data['Ej'], stars=stars)
         slf._abslines.append(init_line)
         # Append with component checking
@@ -147,10 +145,12 @@ class AbsComponent(object):
         Parameters
         ----------
         radec : tuple or SkyCoord
-            (RA,DEC) in deg or astropy.coordinate
-        Zion : tuple 
+            (RA,DEC) in deg or astropy.coordinate.SkyCoord
+        Zion : tuple
             Atomic number, ion -- (int,int)
             e.g. (8,1) for OI
+            Note: (-1, -1) is special and is meant for moleculer (e.g. H2)
+                  This notation will most likely change in the future.
         zcomp : float
             Absorption component redshift
         vlim : Quantity array
@@ -160,10 +160,11 @@ class AbsComponent(object):
             Atomic mass -- used to distinguish isotopes
         Ntup : tuple
             (int,float,float)
-            (flag_N,logN,sig_N)
-            flag_N : Flag describing N measurement
+            (flag_N,logN,sig_logN)
+            flag_N : Flag describing N measurement  (0: no info; 1: detection; 2: saturated; 3: non-detection)
             logN : log10 N column density
             sig_logN : Error in log10 N
+              # TODO FUTURE IMPLEMENTATION WILL ALLOW FOR 2-element ndarray for sig_logN
         Ej : Quantity, optional
             Energy of lower level (1/cm)
         stars : str, optional
@@ -174,10 +175,7 @@ class AbsComponent(object):
         """
 
         # Required
-        if isinstance(radec, (tuple)):
-            self.coord = SkyCoord(ra=radec[0], dec=radec[1])
-        elif isinstance(radec, SkyCoord):
-            self.coord = radec
+        self.coord = ltu.radec_to_coord(radec)
         self.Zion = Zion
         self.zcomp = zcomp
         self.vlim = vlim
@@ -197,7 +195,7 @@ class AbsComponent(object):
             self.sig_logN = 0.
 
         # Name
-        if name is None:
+        if (name is None) and (self.Zion != (-1, -1)):
             iname = ions.ion_name(self.Zion, nspace=0)
             if self.Ej.value > 0:  # Need to put *'s in name
                 try:
@@ -205,6 +203,8 @@ class AbsComponent(object):
                 except:
                     raise IOError("Need to provide 'stars' parameter.")
             self.name = '{:s}_z{:0.5f}'.format(iname, self.zcomp)
+        elif (name is None) and (self.Zion == (-1, -1)):
+            self.name = 'mol_z{:0.5f}'.format(self.zcomp)
         else:
             self.name = name
 
@@ -244,14 +244,21 @@ class AbsComponent(object):
             testc = bool(self.coord.separation(absline.attrib['coord']) < tol)
         else:
             testc = True
-        testZ = self.Zion[0] == absline.data['Z']
-        testi = self.Zion[1] == absline.data['ion']
-        testE = bool(self.Ej == absline.data['Ej'])
+
+        if self.Zion == (-1,-1):  #(-1,-1) represents molecules
+            testZ = True
+            testi = True
+            testE = True
+        else: # atoms
+            testZ = self.Zion[0] == absline.data['Z']
+            testi = self.Zion[1] == absline.data['ion']
+            testE = bool(self.Ej == absline.data['Ej'])
+
         # Now redshift/velocity
         if chk_vel:
             dz_toler = (1 + self.zcomp) * vtoler / c_kms  # Avoid Quantity for speed
-            zlim_line = (1 + absline.attrib['z']) * absline.limits.vlim.to('km/s').value / c_kms
-            zlim_comp = (1+self.zcomp) * self.vlim.to('km/s').value / c_kms
+            zlim_line = absline.limits.zlim  # absline.z + (1 + absline.z) * absline.limits.vlim.to('km/s').value / c_kms
+            zlim_comp = self.zcomp + (1+self.zcomp) * self.vlim.to('km/s').value / c_kms
             testv = (zlim_line[0] >= (zlim_comp[0] - dz_toler)) & (
                 zlim_line[1] <= (zlim_comp[1] + dz_toler))
         else:
@@ -266,14 +273,100 @@ class AbsComponent(object):
             self._abslines.append(absline)
         else:
             warnings.warn("Failed add_absline test")
-            print('Input absline with wrest={:g} does not match component rules. Not appending'.format(absline.wrest))
+            print('Input absline with wrest={:g} at z={:.3f} does not match component rules. Not appending'.format(absline.wrest,
+                                                                                                                   absline.z))
             if not testv:
                 print("Absline velocities lie beyond component\n Set chk_vel=False to skip this test.")
             if not testc:
                 print("Absline coordinates do not match.  Best to set them")
 
+    def add_abslines_from_linelist(self, llist='ISM', init_name=None, wvlim=None, min_Wr=None, **kwargs):
+        """
+        It adds associated AbsLines satisfying some conditions (see parameters below).
+
+        Parameters
+        ----------
+        llist : str, optional
+            Name of the linetools.lists.linelist.LineList
+            object where to look for the transition names.
+            Default is 'ISM', which means the function looks
+            within `list = LineList('ISM')`.
+        init_name : str, optional
+            Name of the initial transition used to define the AbsComponent
+        wvlims : Quantity array, optional
+            Observed wavelength limits for AbsLines to be added.
+            e.g. [1200, 2000]*u.AA.
+        min_Wr : Quantity, optional
+            Minimum rest-frame equivalent with for AbsLines to be added.
+            This is calculated in the very low optical depth regime tau0<<1,
+            where Wr is independent of Doppler parameter or gamma (see eq. 9.15 of
+            Draine 2011). Still, a column density attribute for the AbsComponent
+            is needed.
+
+        Returns
+        -------
+        Adds AbsLine objects to the AbsComponent._abslines list.
+
+        Notes
+        -----
+        **kwargs are passed to AbsLine.add_absline() method.
+
+        """
+        # get the transitions from LineList
+        llist = LineList(llist)
+        if init_name is None:  # we have to guess it
+            if (self.Zion) == (-1, -1):  # molecules
+                # init_name must be in self.attrib (this is a patch)
+                init_name = self.attrib['init_name']
+            else:  # atoms
+                init_name = ions.ion_name(self.Zion, nspace=0)
+        transitions = llist.all_transitions(init_name)
+
+        # unify output to be always QTable
+        if isinstance(transitions, dict):
+            transitions = llist.from_dict_to_qtable(transitions)
+
+        # check wvlims
+        if wvlim is not None:
+            cond = (transitions['wrest']*(1+self.zcomp) >= wvlim[0]) & \
+                   (transitions['wrest']*(1+self.zcomp) <= wvlim[1])
+            transitions = transitions[cond]
+
+        # check outputs
+        if len(transitions) == 0:
+            warnings.warn("No transitions satisfying the criteria found. Doing nothing.")
+            return
+
+        # loop over the transitions when more than one found
+        for transition in transitions:
+            iline = AbsLine(transition['name'], z=self.zcomp, linelist=llist)
+            iline.limits.set(self.vlim)
+            iline.attrib['coord'] = self.coord
+            iline.attrib['logN'] = self.logN
+            iline.attrib['sig_logN'] = self.sig_logN
+            iline.attrib['flag_N'] = self.flag_N
+            iline.attrib['N'] = 10**iline.attrib['logN'] / (u.cm * u.cm)
+            iline.attrib['sig_N'] = 10**iline.attrib['sig_logN'] / (u.cm * u.cm)
+
+            for key in self.attrib.keys():
+                iline.attrib[key] = self.attrib[key]
+
+            if min_Wr is not None:
+                # check logN is defined
+                logN = self.logN
+                if logN == 0:
+                    warnings.warn("AbsComponent does not have logN defined. Appending AbsLines "
+                                  "regardless of min_Wr.")
+                else:
+                    N = 10**logN / (u.cm*u.cm)
+                    Wr_iline = iline.get_Wr_from_N(N=N)  # valid for the tau0<<1 regime.
+                    if Wr_iline < min_Wr:  # do not append
+                        continue
+            # add the absline
+            self.add_absline(iline)
+
     def build_table(self):
-        """Generate an astropy QTable out of the component.
+        """Generate an astropy QTable out of the abs lines
         Returns
         -------
         comp_tbl : QTable
@@ -282,7 +375,8 @@ class AbsComponent(object):
             return
         comp_tbl = QTable()
         comp_tbl.add_column(Column([iline.wrest.to(u.AA).value for iline in self._abslines]*u.AA, name='wrest'))
-        for attrib in ['z', 'flag_N', 'logN', 'sig_logN']:
+        comp_tbl.add_column(Column([iline.z for iline in self._abslines], name='z'))
+        for attrib in ['flag_N', 'logN', 'sig_logN']:
             comp_tbl.add_column(Column([iline.attrib[attrib] for iline in self._abslines], name=attrib))
         # Return
         return comp_tbl
@@ -305,7 +399,7 @@ class AbsComponent(object):
           COG Doppler parameter (km/s)
         """
         from linetools.analysis import cog as ltcog
-        reload(ltcog)
+        #reload(ltcog)
         # Redo EWs?
         if redo_EW:
             for aline in self._abslines:
@@ -354,7 +448,7 @@ class AbsComponent(object):
         ymax = 0.
         for qq, iline in enumerate(gdiline):
             # Calculate
-            velo = iline.analy['spec'].relative_vel((1+iline.attrib['z'])*iline.wrest)
+            velo = iline.analy['spec'].relative_vel((1+iline.z)*iline.wrest)
             cst = atom_cst/(iline.data['f']*iline.wrest)  # / (u.km/u.s) / u.cm * (u.AA/u.cm)
             Na = np.log(1./np.maximum(iline.analy['spec'].flux, iline.analy['spec'].sig)) * cst
 
@@ -641,14 +735,25 @@ class AbsComponent(object):
             s += '\n'
         return s
 
-    def stack_plot(self, **kwargs):
+    def stack_plot(self, return_fig=False, **kwargs):
         """Show a stack plot of the component, if spec are loaded
         Assumes the data are normalized.
 
         Parameters
         ----------
+        return_fig : bool, optional
+            If True, return stack plot as plt.Figure() instance for further manipulation
+
+        Returns
+        -------
+        fig : matplotlib Figure, optional
+            Figure instance containing stack plot with subplots, axes, etc.
         """
-        ltap.stack_plot(self._abslines, vlim=self.vlim, **kwargs)
+        if return_fig:
+            fig = ltap.stack_plot(self._abslines, vlim=self.vlim, return_fig=True, **kwargs)
+            return fig
+        else:
+            ltap.stack_plot(self._abslines, vlim=self.vlim, **kwargs)
 
     def to_dict(self):
         """ Convert component data to a dict
@@ -658,9 +763,10 @@ class AbsComponent(object):
         """
         cdict = dict(Zion=self.Zion, zcomp=self.zcomp, vlim=self.vlim.to('km/s').value,
                      Name=self.name,
-                     RA=self.coord.ra.value, DEC=self.coord.dec.value,
+                     RA=self.coord.fk5.ra.value, DEC=self.coord.fk5.dec.value,
                      A=self.A, Ej=self.Ej.to('1/cm').value, comment=self.comment,
                      flag_N=self.flag_N, logN=self.logN, sig_logN=self.sig_logN)
+        cdict['class'] = self.__class__.__name__
         # AbsLines
         cdict['lines'] = {}
         for iline in self._abslines:
@@ -703,13 +809,13 @@ class AbsComponent(object):
 
     def __repr__(self):
         txt = '<{:s}: {:s} {:s}, Name={:s}, Zion=({:d},{:d}), Ej={:g}, z={:g}, vlim={:g},{:g}'.format(
-            self.__class__.__name__, self.coord.ra.to_string(unit=u.hour,sep=':', pad=True),
-                self.coord.dec.to_string(sep=':',pad=True,alwayssign=True), self.name, self.Zion[0], self.Zion[1], self.Ej, self.zcomp, self.vlim[0], self.vlim[1])
+            self.__class__.__name__, self.coord.fk5.ra.to_string(unit=u.hour,sep=':', pad=True),
+                self.coord.fk5.dec.to_string(sep=':',pad=True,alwayssign=True), self.name, self.Zion[0], self.Zion[1], self.Ej, self.zcomp, self.vlim[0], self.vlim[1])
 
         # Column?
         if self.flag_N > 0:
             txt = txt + ', logN={:g}'.format(self.logN)
-            txt = txt + ', sig_N={:g}'.format(self.sig_logN)
+            txt = txt + ', sig_logN={}'.format(self.sig_logN)
             txt = txt + ', flag_N={:d}'.format(self.flag_N)
 
         # Finish

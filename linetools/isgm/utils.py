@@ -15,13 +15,16 @@ import warnings
 
 from astropy import constants as const
 from astropy import units as u
-from astropy.table import Table
+from astropy.table import Table, QTable
 from astropy.units import Quantity
+from astropy.coordinates import SkyCoord
 
 from linetools.analysis import absline as ltaa
 from linetools.isgm.abscomponent import AbsComponent
-from linetools.utils import give_dz
 from linetools.spectralline import init_analy
+from linetools.abund.ions import name_to_ion, ion_to_name
+from linetools import utils as ltu
+from linetools.lists.linelist import LineList
 
 def chk_components(components, chk_match=False, chk_A_none=False, tol=0.2*u.arcsec):
     """ Performs checks on a list of components
@@ -146,6 +149,7 @@ def build_components_from_dict(idict, coord=None, **kwargs):
     -------
     components :
       list of AbsComponent objects
+      Sorted by zcomp
     """
     from linetools.spectralline import AbsLine
 
@@ -169,27 +173,46 @@ def build_components_from_dict(idict, coord=None, **kwargs):
         components = build_components_from_abslines(lines, **kwargs)
     else:
         warnings.warn("No components in this dict")
+    # Sort by z -- Deals with dict keys being random
+    z = [comp.zcomp for comp in components]
+    isrt = np.argsort(np.array(z))
+    srt_comps = []
+    for idx in isrt:
+        srt_comps.append(components[idx])
     # Return
-    return components
+    return srt_comps
 
 
-def build_systems_from_components(comps, **kwargs):
+def build_systems_from_components(comps, systype=None, vsys=None, **kwargs):
     """ Build a list of AbsSystems from a list of AbsComponents
     Current default implementation allows for overlapping components, i.e.
-      only_overalp=True in add_component
+      only_overlap=True in add_component
 
     Parameters
     ----------
     comps : list
+        List of AbsComponents
+    systype : AbsSystem, optional
+      Defaults to GenericAbsSystem
+    vsys : Quantity, optional
+      'Velocity width' of a system, used when adding components
+      Passed as vtoler to add_component
+      The first component will define the system redshift and all others will
+      need to lie within vsys of it
 
     Returns
     -------
     abs_systems : list
 
     """
-    from linetools.isgm.abssystem import GenericAbsSystem
-    if 'overlap_only' not in kwargs.keys():
-        kwargs['overlap_only'] = True
+    if systype is None:
+        from linetools.isgm.abssystem import GenericAbsSystem
+        systype = GenericAbsSystem
+    if vsys is None:
+        if 'overlap_only' not in kwargs.keys():
+            kwargs['overlap_only'] = True
+    else:
+        kwargs['vtoler'] = vsys.to('km/s').value
     # Add
     abs_systems = []
     cpy_comps = [comp.copy() for comp in comps]
@@ -197,8 +220,7 @@ def build_systems_from_components(comps, **kwargs):
     while len(cpy_comps) > 0:
         # Use the first one
         comp = cpy_comps.pop(0)
-        abssys = GenericAbsSystem.from_components([comp])
-        abs_systems.append(abssys)
+        abssys = systype.from_components([comp])
         # Try the rest
         comps_left = []
         for icomp in cpy_comps:
@@ -206,6 +228,11 @@ def build_systems_from_components(comps, **kwargs):
                 pass
             else:
                 comps_left.append(icomp)
+        # Update vlim
+        abssys.update_vlim()
+        # Append
+        abs_systems.append(abssys)
+        # Save
         cpy_comps = comps_left
     # Return
     return abs_systems
@@ -226,6 +253,140 @@ def xhtbl_from_components(components, ztbl=None, NHI_obj=None):
     # Get started
     tbl = Table()
     #
+
+def complist_from_table(table):
+    """
+    Returns a list of AbsComponents from an input astropy.Table.
+
+    Parameters
+    ----------
+    table : Table
+        Table with component information (each row must correspond
+        to a component). Each column is expecting a unit when
+        appropriate.
+
+    Returns
+    -------
+    complist : list
+        List of AbsComponents defined from the input table.
+
+    Notes
+    -----
+    Mandatory column names: 'RA', 'DEC', 'ion_name', 'z_comp', 'vmin', 'vmax'
+        These column are required.
+    Special column names: 'name', 'comment', 'logN', 'sig_logN', 'flag_logN'
+        These columns will fill internal attributes when corresponding.
+        In order to fill in the Ntuple attribute all three 'logN', 'sig_logN', 'flag_logN'
+        must be present. For convenience 'logN' and 'sig_logN' are expected to be floats
+        corresponding to their values in np.log10(1/cm^2).
+
+    Other columns: 'any_column_name'
+        These will be added as attributes within the AbsComponent.attrib dictionary,
+        with their respective units if given.
+
+    """
+    # Convert to QTable to handle units in individual entries more easily
+    table = QTable(table)
+
+    # mandatory and optional columns
+    min_columns = ['RA', 'DEC', 'ion_name', 'z_comp', 'vmin', 'vmax']
+    special_columns = ['name', 'comment', 'logN', 'sig_logN', 'flag_logN']
+    for colname in min_columns:
+        if colname not in table.keys():
+            raise IOError('{} is a mandatory column. Please make sure your input table has it.'.format(colname))
+
+    #loop over rows
+    complist = []
+    for row in table:
+        # mandatory
+        coord = SkyCoord(row['RA'].to('deg').value, row['DEC'].to('deg').value, unit='deg')  # RA y DEC must both come with units
+        Zion = name_to_ion(row['ion_name'])
+        zcomp = row['z_comp']
+        vlim =[row['vmin'].to('km/s').value, row['vmax'].to('km/s').value] * u.km / u.s  # units are expected here too
+
+        # special columns
+        try:
+            Ntuple = (row['flag_logN'], row['logN'], row['sig_logN'])  # no units expected
+        except KeyError:
+            Ntuple = None
+        try:
+            comment = row['comment']
+        except KeyError:
+            comment = ''
+        try:
+            name = row['name']
+        except KeyError:
+            name = None
+
+        # define the component
+        comp = AbsComponent(coord, Zion, zcomp, vlim, Ntup=Ntuple, comment=comment, name=name)
+
+        # other columns will be filled in comp.attrib dict
+        for colname in table.keys():
+            if (colname not in special_columns) and (colname not in min_columns):
+                kms_cols = ['b', 'sig_b']
+                if colname in kms_cols:  # check units for parameters expected in velocity units
+                    try:
+                        val_aux = row[colname].to('km/s').value * u.km / u.s
+                    except u.UnitConversionError:
+                        raise IOError('If `{}` column is present, it must have velocity units.'.format(colname))
+                    comp.attrib[colname] = val_aux
+                # parameters we do not care about units much
+                else:
+                    comp.attrib[colname] = row[colname]
+
+        # append
+        complist += [comp]
+    return complist
+
+
+def table_from_complist(complist):
+    """
+    Returns a astropy.Table from an input list of AbsComponents. It only
+    fills in mandatory and special attributes (see notes below).
+    Information stored in dictionary AbsComp.attrib is ignored.
+
+    Parameters
+    ----------
+    complist : list of AbsComponents
+        The initial list of AbsComponents to create the QTable from.
+
+    Returns
+    -------
+    table : Table
+        Table from the information contained in each component.
+
+    Notes
+    -----
+    Mandatory columns: 'RA', 'DEC', 'ion_name', 'z_comp', 'vmin', 'vmax'
+    Special columns: 'name', 'comment', 'logN', 'sig_logN', 'flag_logN'
+    See also complist_from_table()
+    """
+    tab = Table()
+
+    # mandatory columns
+    tab['RA'] = [comp.coord.ra.to('deg').value for comp in complist] * u.deg
+    tab['DEC'] = [comp.coord.dec.to('deg').value for comp in complist] * u.deg
+    ion_names = []  # ion_names
+    for comp in complist:
+        if comp.Zion == (-1,-1):
+            ion_names += ["Molecule"]
+        else:
+            ion_names += [ion_to_name(comp.Zion)]
+    tab['ion_name'] = ion_names
+    tab['z_comp'] = [comp.zcomp for comp in complist]
+    tab['vmin'] = [comp.vlim[0].value for comp in complist] * comp.vlim.unit
+    tab['vmax'] = [comp.vlim[1].value for comp in complist] * comp.vlim.unit
+
+    # Special columns
+    tab['logN'] = [comp.logN for comp in complist]
+    tab['sig_logN'] = [comp.sig_logN for comp in complist]
+    tab['flag_logN'] = [comp.flag_N for comp in complist]
+    tab['comment'] = [comp.comment for comp in complist]
+    tab['name'] = [comp.name for comp in complist]
+
+    return tab
+
 
 
 def iontable_from_components(components, ztbl=None, NHI_obj=None):
@@ -267,7 +428,12 @@ def iontable_from_components(components, ztbl=None, NHI_obj=None):
     cols['vmax']=float
     cols['flag_N']=int
     cols['logN']=float
-    cols['sig_logN']=float
+    if isinstance(components[0].sig_logN, float):
+        cols['sig_logN'] = float
+    elif components[0].sig_logN.size == 2:
+        cols['sig_logN'] = np.ndarray
+    else:
+        raise IOError("Not prepared for this type of sig_logN")
     names = cols.keys()
     dtypes = [cols[key] for key in names]
     iontbl = Table(names=names,dtype=dtypes)
@@ -314,10 +480,6 @@ def iontable_from_components(components, ztbl=None, NHI_obj=None):
                        Ej=0./u.cm,vmin=vmin, vmax=vmax, logN=NHI_obj.NHI,
                        flag_N=NHI_obj.flag_NHI,sig_logN=np.mean(NHI_obj.sig_NHI))
             iontbl.add_row(row)
-
-    # Add zlim to metadata
-    meta = OrderedDict()
-    meta['zcomp'] = ztbl
 
     # Return
     return iontbl
@@ -366,6 +528,45 @@ def synthesize_components(components, zcomp=None, vbuff=0*u.km/u.s):
 
     # Return
     return synth_comp
+
+
+def get_components_at_z(complist, z, dvlims):
+    """In a given list of AbsComponents, it finds
+    the ones that are within dvlims from a given redshift
+    and returns a list of those.
+
+    Parameters
+    ----------
+    complist : list
+        List of AbsComponents
+    z : float
+        Redshift to search for components
+    dvlims : Quantity array
+        Rest-frame velocity limits around z
+        to look for components
+
+    Returns
+    -------
+    components_at_z : list
+        List of AbsComponents in complist within dvlims from z
+    """
+    # check input
+    if not isinstance(complist[0], AbsComponent):
+        raise IOError('complist must be a list of AbsComponents.')
+    if len(dvlims) != 2:
+        raise IOError('dvlims must be a Quantity array of velocity limits (vmin, vmax).')
+    else:
+        try:
+            dvlims_kms = dvlims.to('km/s')
+        except u.UnitConversionError:
+            raise IOError('dvlims must have velocity units.')
+
+    good_complist = []
+    for comp in complist:
+        dv_comp = ltu.dv_from_z(comp.zcomp, z)
+        if (dv_comp >= dvlims[0]) and (dv_comp <= dvlims[1]):
+            good_complist += [comp]
+    return good_complist
 
 
 def get_wvobs_chunks(comp):
@@ -441,6 +642,131 @@ def coincident_components(comp1, comp2, tol=0.2*u.arcsec):
 
 
 def group_coincident_compoments(comp_list, output_type='list'):
+    """For a given input list of components, this function
+    groups together components that are coincident to each other
+    (including by transitivity), and returns them as a list (default)
+    or dictionary of component lists.
+
+    Parameters
+    ----------
+    comp_list : list of AbsComponent
+        Input list of components to group
+    output_type : str, optional
+        Type of the output, choose either
+        'list' for list or 'dict' for dictionary.
+
+    Returns
+    -------
+    output : list (or dictionary) of lists of AbsComponent
+        The grouped components as individual lists
+        in the output.
+    """
+    if output_type not in ['list', 'dict', 'dictionary']:
+        raise ValueError("`output_type` must be either 'list' or 'dict'.")
+
+    ### We first want to identify and group all blended lines
+    ### Sort them by observed wavelength to do this
+    lst=[]
+    compnos=[]
+    for ii,comp in enumerate(comp_list):
+        lst.extend(comp._abslines)
+        compnos.extend([ii]*len(comp._abslines))
+    lst=np.array(lst)
+    compnos=np.array(compnos)
+    wv1s=np.array([line.limits.wvlim[0].value for line in lst])
+    sortidxs=np.argsort(wv1s)
+    sort_lst=lst[sortidxs]
+    sort_compnos=compnos[sortidxs] # This will store indices of the lines' parent comps.
+
+    ### Identify the blended 'absline' objects
+    blends = []
+    ### 'blends' is a list of lists
+    ### each sublist will contain the indices of consecutive blended abslines in wobs space
+    for i in range(len(sortidxs)-1):
+        if i == 0:
+            thisblend = [i]
+        if sort_lst[i].coincident_line(sort_lst[i+1]):
+            thisblend.append(i+1)
+        else:
+            blends.append(thisblend)
+            thisblend = [i+1]
+        if i == (len(sortidxs) - 2):
+            blends.append(thisblend)
+
+    ### Associate the lines to their parent components
+    blendnos=[]
+    for blist in blends:
+        blendnos.append(sort_compnos[blist])
+
+    ### Main algorithm to group together all components with blended lines
+    ## Each sublist in 'blends' will be checked to see if the parent components
+    ## of the abslines have abslines in other blend sublists. These sublists
+    ## that share parent components will be grouped together.   Then,
+    compfound=[]  # will hold components that have been grouped
+    grblends=[]  # will hold indices of blends that have been grouped
+    newgroups=[]  # will hold the newly grouped abslines
+    for i,bn in enumerate(blendnos):  # bn is list of indices of parent comps of blended abslines
+        if i in grblends: continue  # move on if blend has already been grouped
+        grblends.append(i)  # so that we don't try to group this sublist twice
+        newgroups.append(bn.tolist()) # start group with parent components of this blend
+        newtotry=bn  # a list of components, which have assoc. abslines, which may be in other blends
+        ## check all of these components' abslines for inclusion in blend groups
+        while (len(newtotry)>0):  # stop when all potential lines in grouped components have been checked
+            newnewtotry=[]
+            for no in newtotry:
+                if no not in compfound:  # Move on if a component's lines have been checked
+                    compfound.append(no)  # So that we don't group this component twice
+                    blgrs=_whichgroupscontainmember(blendnos,no)  # Find which sublists contain abslines for this comp
+                    for bg in blgrs:  # Go through these sublists
+                        if bg not in grblends:  # If this sublist hasn't been checked, save it
+                            grblends.append(bg)
+                            newgroups[-1].extend(blendnos[bg].tolist())  # Add comp numbers to this group
+                            # Now need to check parent comps of abslines in newly added blend sublist
+                            newnewtotry.extend(np.unique(blendnos[bg]).tolist())
+            newtotry=newnewtotry  # Get ready for next round of checking
+            newgroups[-1]=np.unique(np.array(newgroups[-1])).tolist()  # Clean up duplicated comp indices
+
+    out = newgroups
+
+    # Now lets produce the final output from it
+    output_list = []
+    output_dict = {}
+    for ii in range(len(out)):
+        aux_list = []
+        for jj in out[ii]:
+            aux_list += [comp_list[jj]]
+        output_dict['{}'.format(ii)] = aux_list
+        output_list += [aux_list]
+
+    # choose between dict of list
+    if output_type == 'list':
+        return output_list
+    elif output_type in ['dict', 'dictionary']:
+        return output_dict
+
+def _whichgroupscontainmember(groups,member):
+    ''' Once blends have been identified, find which blend a given line index belongs to.
+    Parameters
+    ----------
+    groups : list of lists
+        Input list of groups within which you want to find a member
+        Here, this is used for groups of blended line indices
+    member : object with same type as those in 'groups'
+        Value for which to search within groups.
+        Here, this corresponds to a specific line index
+
+    Returns
+    -------
+    matches : list
+        Indices of groups within with 'member' was found
+    '''
+    matches=[]
+    for i,gr in enumerate(groups):
+        if member in gr:
+            matches.append(i)
+    return matches
+
+def group_coincident_compoments_old(comp_list, output_type='list'):
     """For a given input list of components, this function
     groups together components that are coincident to each other
     (including by transitivity), and returns them as a list (default)
@@ -560,3 +886,5 @@ def joebvp_from_components(comp_list, specfile, outfile):
         s = comp.repr_joebvp(specfile, flags=flags, b_default=b_val)  # still, b values from abslines take precedence if they exist
         f.write(s)
     f.close()
+
+
